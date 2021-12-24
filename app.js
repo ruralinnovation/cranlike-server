@@ -14,6 +14,7 @@ var manRouter = require('./routes/man');
 var apiRouter = require('./routes/api');
 var reposRouter = require('./routes/repos');
 var badgesRouter = require('./routes/badges');
+var feedsRouter = require('./routes/feeds');
 
 /* Connect to DB */
 const HOST = process.env.CRANLIKE_MONGODB_SERVER || 'localhost';
@@ -27,6 +28,17 @@ mongodb.MongoClient.connect(URL, {useUnifiedTopology: true}, function(error, cli
 	const db = client.db('cranlike');
 	global.bucket = new mongodb.GridFSBucket(db, {bucketName: 'files'});
 	global.packages = db.collection('packages');
+
+	/* Speed up common query fields */
+	packages.createIndex("_user");
+	packages.createIndex("_selfowned");
+	packages.createIndex("_published");
+	packages.createIndex("_builder.maintainer.login");
+	packages.createIndex("_builder.commit.time");
+	packages.indexes().then(function(x){
+		console.log("Current indexes() for packages:")
+		console.log(x);
+	});
 });
 
 /* Start App */
@@ -48,6 +60,7 @@ app.use('/', manRouter);
 app.use('/', apiRouter);
 app.use('/', reposRouter);
 app.use('/', badgesRouter);
+app.use('/', feedsRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

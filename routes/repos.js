@@ -72,28 +72,43 @@ function etagify(x){
 	return 'W/"' +  x + '"';
 }
 
-function qf(x){
-	if(x._user == ":any"){
+function qf(x, query_by_user_or_maintainer){
+	const user = x._user;
+	if(user == ":any"){
 		delete x._user;
+		if(query_by_user_or_maintainer){
+			x['_selfowned'] = true;
+		}
+	} else if(query_by_user_or_maintainer) {
+		delete x._user;
+		x['$or'] = [
+			{'_user': user},
+			{'_builder.maintainer.login': user, '_selfowned': true}
+		];
 	}
 	return x;
 }
 
 function packages_index(query, format, req, res, next){
+	if(format && format !== 'gz' && format !== 'json'){
+		return next(createError(404, 'Unsupported PACKAGES format: ' + format));
+	}
 	var cursor = packages.find(query).project(pkgfields).sort({"_id" : -1});
 	cursor.hasNext().then(function(has_any_data){
-		if(has_any_data){
-			return cursor.next(); //promise to read 1 record
+		/* Cache disabled until we solve _id bug */
+		if(0 && has_any_data){
+			return cursor.next(); //promise to read 1st record
 		}
 	}).then(function(doc){
 		if(doc){
 			var etag = etagify(doc['_id']);
-			/* Cache disabled until we solve _id bug */
-			if(0 && etag === req.header('If-None-Match')){
+			if(etag === req.header('If-None-Match')){
 				cursor.close();
 				res.status(304).send();
 				return; //DONE!
 			} else {
+				/* Jeroen: the next() / rewind() here seems to trigger a warning/ bug in the mongo driver:
+				   Field 'cursors' contains an element that is not of type long: 0 */
 				cursor.rewind();
 				res.set('ETag', etag);
 			}
@@ -113,6 +128,7 @@ function packages_index(query, format, req, res, next){
 				.transformStream({transform: doc_to_ndjson})
 				.pipe(res.type('text/plain'));
 		} else {
+			cursor.close();
 			next(createError(404, 'Unknown PACKAGES format: ' + format));
 		}
 	}).catch(error_cb(400, next));
@@ -339,7 +355,7 @@ router.get('/:user/bin/macosx/:xcode?/contrib/:built/:pkg.tgz', function(req, re
 
 /* For now articles are only vignettes */
 router.get('/:user/articles', function(req, res, next){
-  var query = qf({_user: req.params.user, _type: 'src', '_builder.vignettes' : { $exists: true }});
+  var query = qf({_user: req.params.user, _type: 'src', '_builder.vignettes' : { $exists: true }}, req.query.all);
   packages.distinct('Package', query).then(function(x){
     res.send(x);
   }).catch(error_cb(400, next));
@@ -357,21 +373,21 @@ router.get('/:user/articles/:pkg/:file?', function(req, res, next){
 router.get("/:user/stats/vignettes", function(req, res, next) {
   var limit = parseInt(req.query.limit) || 200;
   var cursor = packages.aggregate([
-    {$match: qf({_user: req.params.user, _type: 'src', '_builder.vignettes' : {$exists: true}})},
-    {$sort : {'_builder.timestamp' : -1}},
+    {$match: qf({_user: req.params.user, _type: 'src', '_builder.vignettes' : {$exists: true}}, req.query.all)},
+    {$sort : {'_builder.commit.time' : -1}},
     {$limit : limit},
     {$project: {
       _id: 0,
+      user: '$_user',
       package: '$Package',
       version: '$Version',
       maintainer: '$Maintainer',
       universe: '$_user',
       pkglogo: '$_builder.pkglogo',
       upstream: '$_builder.upstream',
-      maintainerlogin: '$_builder.maintainerlogin',
-      published: '$_builder.timestamp',
+      maintainerlogin: '$_builder.maintainer.login',
+      published: '$_builder.commit.time',
       builddate: '$_builder.date',
-      registered: '$_builder.registered',
       vignette: '$_builder.vignettes'
     }},
     {$unwind: '$vignette'}
@@ -383,7 +399,7 @@ router.get("/:user/stats/vignettes", function(req, res, next) {
 
 /* Public aggregated data (these support :any users)*/
 router.get('/:user/stats/descriptions', function(req, res, next) {
-	var query = qf({_user: req.params.user, _type: 'src', '_builder.registered' : {$ne: 'false'}});
+	var query = qf({_user: req.params.user, _type: 'src', '_builder.registered' : {$ne: 'false'}}, req.query.all);
 	var cursor = packages.find(query).sort({"_id" : -1}).project({_id:0, _type:0});
 	cursor.hasNext().then(function(){
 		cursor.transformStream({transform: doc_to_ndjson}).pipe(res.type('text/plain'));
@@ -392,7 +408,7 @@ router.get('/:user/stats/descriptions', function(req, res, next) {
 
 /* Failures(these support :any users)*/
 router.get('/:user/stats/failures', function(req, res, next) {
-  var query = qf({_user: req.params.user, _type: 'failure'});
+  var query = qf({_user: req.params.user, _type: 'failure'}, req.query.all);
   var cursor = packages.find(query).sort({"_id" : -1}).project({_id:0, _type:0});
   cursor.hasNext().then(function(){
     cursor.transformStream({transform: doc_to_ndjson}).pipe(res.type('text/plain'));
@@ -401,15 +417,16 @@ router.get('/:user/stats/failures', function(req, res, next) {
 
 /* Public aggregated data (these support :any users)*/
 router.get('/:user/stats/checks', function(req, res, next) {
+	var user = req.params.user;
 	var limit = parseInt(req.query.limit) || 500;
-	var query = qf({_user: req.params.user});
+	var query = qf({_user: user}, req.query.all);
 	if(req.query.maintainer)
 		query.Maintainer = {$regex: req.query.maintainer, $options: 'i'};
 	var cursor = packages.aggregate([
 		{$match: query},
 		{$group : {
 			_id : { package:'$Package', version:'$Version', user: '$_user', maintainer: '$Maintainer'},
-			timestamp: { $max : "$_builder.timestamp" },
+			timestamp: { $max : "$_builder.commit.time" },
 			os_restriction: { $addToSet: '$OS_type'},
 			runs : { $addToSet: { type: "$_type", builder: "$_builder", built: '$Built', date:'$_published'}}
 		}},
@@ -426,31 +443,35 @@ router.get('/:user/stats/checks', function(req, res, next) {
 });
 
 router.get("/:user/stats/maintainers", function(req, res, next) {
+	var query = {_user: req.params.user, _type: 'src', '_builder.registered' : {$ne: 'false'}};
 	var cursor = packages.aggregate([
-		{$match: qf({_user: req.params.user, _type: 'src', '_builder.registered' : {$ne: 'false'}})},
-		{$set: { email: { $regexFind: { input: "$Maintainer", regex: /^(.+)<(.*)>$/ } } } },
+		{$match: qf(query, req.query.all)},
 		{$project: {
 			_id: 0,
 			package: '$Package',
 			user: '$_user',
-			login: '$_builder.maintainerlogin',
+			login: '$_builder.maintainer.login', //TODO: change to .maintainer.login
+			orcid: '$_builder.maintainer.orcid',
+			updated: '$_builder.commit.time',
 			registered: '$_builder.registered',
-			name: { $trim: { input: { $first: '$email.captures'}}},
-			email: { $arrayElemAt: ['$email.captures',1]}
+			name: '$_builder.maintainer.name',
+			email: '$_builder.maintainer.email',
 		}},
 		{$unwind: '$email'},
 		{$group: {
 			_id : '$email',
+			updated: { $max: '$updated'},
 			name : { $first: '$name'},
 			login : { $addToSet: '$login'}, //login can be null
+			orcids : { $addToSet: '$orcid'}, //orcid can be null or more than 1
 			packages : { $addToSet: {
 				package: '$package',
 				registered: '$registered',
 				user: '$user'
 			}}
 		}},
-		{$project: {_id: 0, name: 1, login: { '$first' : '$login'}, email: '$_id', packages: '$packages'}},
-		{$sort:{ email: 1}}
+		{$project: {_id: 0, name: 1, login: { '$first' : '$login'}, orcids: 1, email: '$_id', packages: '$packages', updated: 1}},
+		{$sort:{ updated: -1}}
 	]);
 	cursor.hasNext().then(function(){
 		cursor.transformStream({transform: doc_to_ndjson}).pipe(res.type('text/plain'));
@@ -458,22 +479,25 @@ router.get("/:user/stats/maintainers", function(req, res, next) {
 });
 
 router.get("/:user/stats/organizations", function(req, res, next) {
+	var query = {_user: req.params.user, _type: 'src', '_builder.registered' : {$ne: 'false'}};
 	var cursor = packages.aggregate([
-		{$match: qf({_user: req.params.user, _type: 'src', '_builder.registered' : {$ne: 'false'}})},
-		{$set: { email: { $regexFind: { input: "$Maintainer", regex: /^(.+)<(.*)>$/ } } } },
+		{$match: qf(query, req.query.all)},
 		{$project: {
 			_id: 0,
 			package: '$Package',
 			user: '$_user',
-			name: { $trim: { input: { $first: '$email.captures'}}},
-			email: { $arrayElemAt: ['$email.captures',1]}
+			updated: '$_builder.commit.time',
+			name: '$_builder.maintainer.name',
+			email: '$_builder.maintainer.email',
 		}},
 		{$group: {
 			_id : '$user',
+			updated: { $max: '$updated'},
 			packages : { $addToSet: '$package'},
 			maintainers: { $addToSet: '$email'}
 		}},
-		{$project: {_id: 0, organization: '$_id', packages: 1, maintainers: 1}}
+		{$project: {_id: 0, organization: '$_id', packages: 1, maintainers: 1, updated: 1}},
+		{$sort:{ updated: -1}}
 	]);
 	cursor.hasNext().then(function(){
 		cursor.transformStream({transform: doc_to_ndjson}).pipe(res.type('text/plain'));
@@ -513,6 +537,23 @@ router.get("/:user/stats/sysdeps", function(req, res, next) {
 	cursor.hasNext().then(function(){
 		cursor.transformStream({transform: doc_to_ndjson}).pipe(res.type('text/plain'));
 	}).catch(error_cb(400, next));
+});
+
+router.get("/:user/stats/oldies", function(req, res, next) {
+  var before = new Date(req.query.before || "2021-12-31");
+  var query = qf({_user: req.params.user, '_published' : {'$lt': before }});
+  var cursor = packages.find(query).project({
+    _id: 0,
+    type: '$_type',
+    user: '$_user',
+    package: '$Package',
+    version: '$Version',
+    r: '$Built.R',
+    date: { $dateToString: { format: "%Y-%m-%d", date: "$_published" } }
+  });
+  cursor.hasNext().then(function(){
+    cursor.transformStream({transform: doc_to_ndjson}).pipe(res.type('text/plain'));
+  }).catch(error_cb(400, next));
 });
 
 /* Operations below do not support :any user because they are very heavy */

@@ -185,15 +185,23 @@ function filter_keys(x, regex){
 	return out;
 }
 
+function from_base64_gzip(str){
+	if(!str) return str;
+	let input = str.replace(/-/g, '+').replace(/_/g, '/'); //also support base64url format
+	let buff = Buffer.from(str, 'base64');
+	let json = zlib.unzipSync(buff).toString('utf-8');
+	return JSON.parse(json);
+}
+
 function parse_builder_fields(x){
 	var builder = filter_keys(x, /^builder-/gi);
 	if(builder.sysdeps)
 		builder.sysdeps = rdesc.parse_dep_string(builder.sysdeps);
-	if(builder.vignettes){
-		let buff = Buffer.from(builder.vignettes, 'base64');
-		let json = zlib.unzipSync(buff).toString('utf-8');
-		builder.vignettes = JSON.parse(json);
-	}
+	builder.vignettes = from_base64_gzip(builder.vignettes);
+	builder.commit = from_base64_gzip(builder.commit);
+	builder.maintainer = from_base64_gzip(builder.maintainer) || {};
+	/* For backward compatibility, remove later */
+	builder.maintainerlogin = builder.maintainerlogin || builder.maintainer.login;
 	return builder;
 }
 
@@ -224,6 +232,13 @@ function parse_major_version(built){
 	return r_major_version;
 }
 
+function get_repo_owner(description){
+  var url = description['_builder'].upstream || "";
+  if(url.indexOf("github.com/") > 0){
+    return url.split('/').at(-2).toLowerCase();
+  }
+}
+
 router.put('/:user/packages/:package/:version/:type/:md5', function(req, res, next){
 	var user = req.params.user;
 	var package = req.params.package;
@@ -238,7 +253,10 @@ router.put('/:user/packages/:package/:version/:type/:md5', function(req, res, ne
 			description['_type'] = type;
 			description['_file'] = filename;
 			description['_published'] = new Date();
-			description['_builder'] = parse_builder_fields(req.headers);
+			description['_builder'] = parse_builder_fields(req.headers) || {};
+			description['_owner'] = get_repo_owner(description);
+			description['_selfowned'] = description['_owner'] === user;
+			description['_registered'] = (description['_builder'].registered !== "false");
 			description['MD5sum'] = md5;
 			description = merge_dependencies(description);
 			validate_description(description, package, version, type);
@@ -266,10 +284,12 @@ router.post('/:user/packages/:package/:version/failure', upload.none(), function
   var package = req.params.package;
   var version = req.params.version;
   var builder = parse_builder_fields(req.body);
-  var maintainer = builder.maintainer;
-  delete builder.maintainer; /* submit maintainer as build-field instead of description */
+  var maintainer = `${builder.maintainer.name} <${builder.maintainer.email}>`;
   var query = {_type : 'failure', _user : user, Package : package};
-  var description = {...query, Version: version, Maintainer: maintainer, _builder: builder};
+  var description = {...query, Version: version, Maintainer: maintainer, _builder: builder, _published: new Date()};
+  description['_owner'] = get_repo_owner(description);
+  description['_selfowned'] = description['_owner'] === user;
+  description['_registered'] = (description['_builder'].registered !== "false");
   packages.findOneAndReplace(query, description, {upsert: true})
     .then(() => res.send(description))
     .catch(error_cb(400, next))
@@ -295,6 +315,9 @@ router.post('/:user/packages/:package/:version/:type', upload.fields([{ name: 'f
 			description['_file'] = filename;
 			description['_published'] = new Date();
 			description['_builder'] = parse_builder_fields(req.body);
+			description['_owner'] = get_repo_owner(description);
+			description['_selfowned'] = description['_owner'] === user;
+			description['_registered'] = (description['_builder'].registered !== "false");
 			description['MD5sum'] = md5;
 			description = merge_dependencies(description);
 			validate_description(description, package, version, type);
